@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include <inttypes.h>
 #include <time.h>
-
+#include <sys/syscall.h>
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
@@ -18,6 +18,7 @@
 #define NO_INSTRUMENT
 #endif
 
+int beginrecord = 1;
 // ----------- timing (ns) -----------
 static inline uint64_t NO_INSTRUMENT now_ns() {
   timespec ts;
@@ -174,7 +175,7 @@ static void NO_INSTRUMENT print_top10_spread() {
     merge_thread_stats();
     std::vector<Row> rows;
     rows.reserve(g_stats.size());
-
+    beginrecord = 0;
     for (auto& kv : g_stats) {
         const Stats& s = kv.second;
         uint64_t spread = (s.max_ns >= s.min_ns) ? (s.max_ns - s.min_ns) : 0;
@@ -197,46 +198,7 @@ static void NO_INSTRUMENT print_top10_spread() {
     }
     std::fprintf(stderr, "=============================================================\n");
 }
-#if 0
-static void NO_INSTRUMENT print_top10_spread() {
-  struct Row {
-    void* fn;
-    uint64_t min_ns;
-    uint64_t max_ns;
-    uint64_t spread_ns;
-    uint64_t count;
-  };
 
-  std::vector<Row> rows;
-  {
-	  //std::lock_guard<std::mutex> lock(g_mu);
-    rows.reserve(g_stats.size());
-    for (auto& kv : g_stats) {
-      const Stats& s = kv.second;
-      // Only meaningful if called at least twice; otherwise spread=0.
-      uint64_t spread = (s.max_ns >= s.min_ns) ? (s.max_ns - s.min_ns) : 0;
-      rows.push_back(Row{kv.first, s.min_ns, s.max_ns, spread, s.count});
-    }
-  }
-
-  std::sort(rows.begin(), rows.end(),
-            [](const Row& a, const Row& b) { return a.spread_ns > b.spread_ns; });
-
-  const size_t topN = std::min<size_t>(50, rows.size());
-  std::fprintf(stderr, "\n=== Top %zu functions by (max_duration - min_duration) [ns] ===\n", topN);
-  std::fprintf(stderr, "%-4s %-40s %12s %12s %12s %8s\n",
-               "Rank", "Function", "min(ns)", "max(ns)", "spread", "calls");
-
-  for (size_t i = 0; i < topN; i++) {
-    char buf[100];
-    const char* name = symbolize_addr(rows[i].fn, buf, sizeof(buf));
-    std::fprintf(stderr, "%-4zu %-100s %12" PRIu64 " %12" PRIu64 " %12" PRIu64 " %8" PRIu64 "\n",
-                 i + 1, name,
-                 rows[i].min_ns, rows[i].max_ns, rows[i].spread_ns, rows[i].count);
-  }
-  std::fprintf(stderr, "=============================================================\n");
-}
-#endif
 // Ensure we print once at exit
 static std::atomic<bool> g_registered{false};
 
@@ -247,16 +209,74 @@ static void NO_INSTRUMENT ensure_registered() {
   }
 }
 extern "C" {
-	extern int startrecord;	
+	extern int startrecord;
+	void *symbol_addr = 0;
 }
+
+
 void sigusr1_handler(int signum) {
 	print_top10_spread();
 }
 bool call_init_finished = false;
 __attribute__((constructor)) void init_after_call_init() {
 	// Set the flag to true once initialization is done
+	symbol_addr = dlsym(RTLD_NEXT, "write");
 	signal(SIGUSR1, sigusr1_handler);
 	call_init_finished = true;
+}
+
+struct ExitAudit {
+  ~ExitAudit() noexcept {
+    // Avoid throwing from destructors.
+	  beginrecord = 0;
+	  ::fflush(stderr);
+  }
+};
+
+// Global object: constructed at load, destroyed at normal exit.
+static ExitAudit g_exit_audit;
+static thread_local int g_in_hook = 0;
+
+// Function pointer to the real write()
+using write_fn_t = ssize_t(*)(int, const void*, size_t);
+static write_fn_t real_write = nullptr;
+
+static inline ssize_t safe_write(int fd, const void* buf, size_t n) {
+  return ::syscall(SYS_write, fd, buf, n);  // bypass libc + bypass interposition
+}
+
+__attribute__((constructor))
+static void init_syms() {
+  // Avoid iostream/stdio here; keep constructor minimal.
+  real_write = reinterpret_cast<write_fn_t>(::dlsym(RTLD_NEXT, "write"));
+}
+
+// Interpose the C symbol "write"
+extern "C" ssize_t write(int fd, const void* buf, size_t count) {
+  if (!real_write) {
+    real_write = reinterpret_cast<write_fn_t>(::dlsym(RTLD_NEXT, "write"));
+    if (!real_write) {
+      errno = ENOSYS;
+      return -1;
+    }
+  }
+
+  if (g_in_hook) {
+    // Re-entrant call: go straight to syscall
+    return safe_write(fd, buf, count);
+  }
+
+  g_in_hook = 1;
+
+  // --- your audit logic (keep it async-signal-safe-ish) ---
+  const char msg[] = "[audit] write() called\n";
+  safe_write(STDERR_FILENO, msg, sizeof(msg) - 1);
+  beginrecord = 0;
+  // Call the real libc write
+  ssize_t rc = real_write(fd, buf, count);
+
+  g_in_hook = 0;
+  return rc;
 }
 
 extern "C" {
@@ -264,17 +284,18 @@ extern "C" {
 	extern void * _ZN7console11set_displayE12display_type;
 	extern void * _ZN7console8readlineERNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb;
 	void *symbol_addr = &_ZN7console8readlineERNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEb;
-#endif	
-	int beginrecord = 1;
+#endif
+
+
 thread_local bool has_entered = false;
 thread_local bool has_exited = false;
 	bool is_function_excluded(void* this_function);
-
+	
 
 void NO_INSTRUMENT __cyg_profile_func_enter(void* this_fn, void* call_site) {
 #if 0	
 	if (symbol_addr == this_fn) {
-		beginrecord = 1;
+		beginrecord = 0;
 	}
 #endif
 	if (has_entered || !call_init_finished|| has_exited||!beginrecord)
@@ -284,7 +305,7 @@ void NO_INSTRUMENT __cyg_profile_func_enter(void* this_fn, void* call_site) {
 	
 	has_entered = true;
 	(void)call_site;
-	//ensure_registered();
+	ensure_registered();
 
 	// record start time on per-thread stack
 	tls_stack.push_back(Frame{this_fn, now_ns()});
